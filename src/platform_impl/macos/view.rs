@@ -444,7 +444,10 @@ declare_class!(
             {
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
-                if *prev_input_source != current_input_source && self.is_ime_enabled() {
+                if *prev_input_source != current_input_source
+                    && self.is_ime_enabled()
+                    && !unsafe { self.hasMarkedText() }
+                {
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
                     self.ivars().ime_state.set(ImeState::Disabled);
