@@ -40,3 +40,7 @@ The migration guide could reference other migration examples in the current
 changelog entry.
 
 ## Unreleased
+
+### Added
+
+- On macOS, add `set_ime_text`, `take_ime_clauses`, and `take_ime_replacement` for IME clauses and reconversion.
