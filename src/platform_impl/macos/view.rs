@@ -262,6 +262,16 @@ declare_class!(
         #[method(selectedRange)]
         fn selected_range(&self) -> NSRange {
             trace_scope!("selectedRange");
+            // Rune: the app's selection in the text it published, so the input method can
+            // reconvert it.
+            if self.ivars().marked_text.borrow().length() == 0 {
+                if let Some(range) = super::ime_text::TEXT.with(|t| t.borrow().as_ref().map(|(text, sel)| {
+                    let a = super::ime_text::utf16_of(text, sel.start);
+                    NSRange::new(a, super::ime_text::utf16_of(text, sel.end).saturating_sub(a))
+                })) {
+                    return range;
+                }
+            }
             // Documented to return `{NSNotFound, 0}` if there is no selection.
             NSRange::new(NSNotFound as NSUInteger, 0)
         }
@@ -271,16 +281,27 @@ declare_class!(
             &self,
             string: &NSObject,
             selected_range: NSRange,
-            _replacement_range: NSRange,
+            replacement_range: NSRange,
         ) {
-            // TODO: Use _replacement_range, requires changing the event to report surrounding text.
             trace_scope!("setMarkedText:selectedRange:replacementRange:");
+
+            // Rune: a reconversion names the range of the published text the marked text replaces.
+            if replacement_range.location != NSNotFound as NSUInteger {
+                super::ime_text::TEXT.with(|t| if let Some((text, _)) = &*t.borrow() {
+                    let a = super::ime_text::byte_of(text, replacement_range.location);
+                    let b = super::ime_text::byte_of(text, replacement_range.location.saturating_add(replacement_range.length));
+                    super::ime_text::REPLACEMENT.with(|r| *r.borrow_mut() = Some(a..b));
+                });
+            }
 
             // SAFETY: This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
             let (marked_text, string) = if string.is_kind_of::<NSAttributedString>() {
                 let string: *const NSObject = string;
                 let string: *const NSAttributedString = string.cast();
                 let string = unsafe { &*string };
+                // Rune: the clauses, by the input method's clause segments and underlines.
+                let clauses = marked_clauses(string);
+                super::ime_text::CLAUSES.with(|c| *c.borrow_mut() = Some((string.string().to_string(), clauses)));
                 (
                     NSMutableAttributedString::from_attributed_nsstring(string),
                     string.string(),
@@ -354,17 +375,31 @@ declare_class!(
         #[method_id(validAttributesForMarkedText)]
         fn valid_attributes_for_marked_text(&self) -> Retained<NSArray<NSAttributedStringKey>> {
             trace_scope!("validAttributesForMarkedText");
-            NSArray::new()
+            // Rune: the underline and clause segments, which carry a composition's clauses.
+            NSArray::from_vec(vec![NSString::from_str("NSUnderline"), NSString::from_str("NSMarkedClauseSegment")])
         }
 
         #[method_id(attributedSubstringForProposedRange:actualRange:)]
         fn attributed_substring_for_proposed_range(
             &self,
-            _range: NSRange,
-            _actual_range: *mut NSRange,
+            range: NSRange,
+            actual_range: *mut NSRange,
         ) -> Option<Retained<NSAttributedString>> {
             trace_scope!("attributedSubstringForProposedRange:actualRange:");
-            None
+            // Rune: the published text, for reconversion and Look Up.
+            super::ime_text::TEXT.with(|t| {
+                let t = t.borrow();
+                let (text, _) = t.as_ref()?;
+                let a = super::ime_text::byte_of(text, range.location);
+                let b = super::ime_text::byte_of(text, range.location.saturating_add(range.length));
+                if a >= b { return None; }
+                if !actual_range.is_null() {
+                    let ua = super::ime_text::utf16_of(text, a);
+                    // SAFETY: AppKit's out-parameter, checked non-null.
+                    unsafe { *actual_range = NSRange::new(ua, super::ime_text::utf16_of(text, b) - ua) };
+                }
+                Some(NSAttributedString::from_nsstring(&NSString::from_str(&text[a..b])))
+            })
         }
 
         #[method(characterIndexForPoint:)]
@@ -1141,5 +1176,78 @@ fn replace_event(event: &NSEvent, option_as_alt: OptionAsAlt) -> Retained<NSEven
         }
     } else {
         event.copy()
+    }
+}
+
+/// Rune: a marked text's clauses, byte ranges with whether each is the one being converted: one
+/// per run of `NSMarkedClauseSegment` (or of the underline when an input method sets no
+/// segments), the target the one with a thick underline.
+fn marked_clauses(string: &NSAttributedString) -> Vec<(std::ops::Range<usize>, bool)> {
+    let text = string.string();
+    let utf8 = text.to_string();
+    let len = text.length();
+    let (segment, underline) =
+        (NSString::from_str("NSMarkedClauseSegment"), NSString::from_str("NSUnderline"));
+    let attribute = |key: &NSString,
+                     at: NSUInteger,
+                     range: &mut NSRange|
+     -> Option<Retained<AnyObject>> {
+        // SAFETY: `at` is inside the string; `range` is a valid out-parameter.
+        unsafe {
+            msg_send_id![string, attribute: key, atIndex: at, effectiveRange: range as *mut NSRange]
+        }
+    };
+    let mut probe = NSRange::new(0, 0);
+    let by =
+        if len > 0 && attribute(&segment, 0, &mut probe).is_some() { &segment } else { &underline };
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < len {
+        let mut run = NSRange::new(0, 0);
+        let _ = attribute(by, at, &mut run);
+        let end = run.location.saturating_add(run.length).clamp(at + 1, len);
+        let mut ignored = NSRange::new(0, 0);
+        // NSUnderlineStyleThick is 2; an input method marks the clause being converted with it.
+        let style: isize = attribute(&underline, at, &mut ignored)
+            .map_or(0, |v| unsafe { objc2::msg_send![&*v, integerValue] });
+        out.push((
+            super::ime_text::byte_of(&utf8, at)..super::ime_text::byte_of(&utf8, end),
+            style & 0xf >= 2,
+        ));
+        at = end;
+    }
+    out
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+
+    fn set_attribute(string: &NSMutableAttributedString, key: &str, value: isize, range: NSRange) {
+        // SAFETY: NSNumber and the attributed string receive their documented argument types.
+        unsafe {
+            let number: Retained<AnyObject> =
+                msg_send_id![objc2::class!(NSNumber), numberWithInteger: value];
+            let _: () = objc2::msg_send![string, addAttribute: &*NSString::from_str(key), value: &*number, range: range];
+        }
+    }
+
+    #[test]
+    fn clauses_use_segments_and_thick_underline_with_byte_offsets() {
+        let string = NSMutableAttributedString::from_nsstring(&NSString::from_str("日😀本"));
+        set_attribute(&string, "NSMarkedClauseSegment", 0, NSRange::new(0, 3));
+        set_attribute(&string, "NSMarkedClauseSegment", 1, NSRange::new(3, 1));
+        set_attribute(&string, "NSUnderline", 2, NSRange::new(3, 1));
+        assert_eq!(marked_clauses(&string), vec![(0..7, false), (7..10, true)]);
+    }
+
+    #[test]
+    fn clauses_fall_back_to_underline_runs_and_accept_empty_text() {
+        let string = NSMutableAttributedString::from_nsstring(&NSString::from_str("日本"));
+        set_attribute(&string, "NSUnderline", 1, NSRange::new(0, 1));
+        set_attribute(&string, "NSUnderline", 2, NSRange::new(1, 1));
+        assert_eq!(marked_clauses(&string), vec![(0..3, false), (3..6, true)]);
+        let empty = NSAttributedString::from_nsstring(&NSString::from_str(""));
+        assert!(marked_clauses(&empty).is_empty());
     }
 }
