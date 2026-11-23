@@ -405,7 +405,9 @@ impl WinitPointerDataInner {
         }
 
         // A previous source may never send its stop, especially for continuous scroll.
-        if self.scroll.source.zip(source).is_some_and(|(previous, source)| previous != source) {
+        let source_changed =
+            self.scroll.source.zip(source).is_some_and(|(previous, source)| previous != source);
+        if source_changed {
             if !moving {
                 return;
             }
@@ -421,20 +423,21 @@ impl WinitPointerDataInner {
         self.scroll.vertical = (self.scroll.vertical || vertical.absolute != 0.0) && !vertical.stop;
         let active = self.scroll.horizontal || self.scroll.vertical;
 
-        if was_active && !active {
-            emit(delta, TouchPhase::Ended);
-        } else if moving {
-            emit(delta, if was_active { TouchPhase::Moved } else { TouchPhase::Started });
-            if !active {
+        if !active {
+            if source_changed {
+                // A complete gesture from the new source must not release the previous one.
                 emit(
                     MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
-                    TouchPhase::Ended,
+                    TouchPhase::Cancelled,
                 );
             }
-        }
-
-        if !active {
+            if was_active || moving {
+                // A single frame supplies no time interval for a start and end.
+                emit(delta, TouchPhase::Ended);
+            }
             self.scroll = PrecisionScroll::default();
+        } else if moving {
+            emit(delta, if was_active { TouchPhase::Moved } else { TouchPhase::Started });
         }
     }
 }
@@ -712,10 +715,7 @@ mod tests {
         let idle = AxisScroll::default();
         let mut pointer = WinitPointerDataInner::default();
         let flick = AxisScroll { absolute: -3.0, ..stop() };
-        assert_eq!(scroll(&mut pointer, idle, flick), [
-            pixel(0.0, 6.0, TouchPhase::Started),
-            pixel(0.0, 0.0, TouchPhase::Ended)
-        ],);
+        assert_eq!(scroll(&mut pointer, idle, flick), [pixel(0.0, 6.0, TouchPhase::Ended)]);
         assert_eq!(scroll(&mut pointer, idle, motion(-1.0)), [pixel(
             0.0,
             2.0,
@@ -723,6 +723,27 @@ mod tests {
         )],);
         assert_eq!(scroll(&mut pointer, idle, flick), [pixel(0.0, 6.0, TouchPhase::Ended)]);
         assert!(scroll(&mut pointer, idle, stop()).is_empty());
+    }
+
+    #[test]
+    fn same_axis_motion_and_stop_after_a_source_switch_cancels_the_previous_gesture() {
+        let mut pointer = WinitPointerDataInner::default();
+        assert_eq!(
+            scroll_frame(&mut pointer, ScrollFrame {
+                vertical: motion(-1.0),
+                source: Some(AxisSource::Continuous),
+                ..ScrollFrame::default()
+            },),
+            [pixel(0.0, 2.0, TouchPhase::Started)],
+        );
+        assert_eq!(
+            scroll_frame(&mut pointer, ScrollFrame {
+                vertical: AxisScroll { absolute: -3.0, ..stop() },
+                source: Some(AxisSource::Finger),
+                ..ScrollFrame::default()
+            },),
+            [pixel(0.0, 0.0, TouchPhase::Cancelled), pixel(0.0, 6.0, TouchPhase::Ended),],
+        );
     }
 
     #[test]
