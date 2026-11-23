@@ -7,7 +7,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use sctk::reexports::client::delegate_dispatch;
-use sctk::reexports::client::protocol::wl_pointer::WlPointer;
+use sctk::reexports::client::protocol::wl_pointer::{AxisSource, WlPointer};
 use sctk::reexports::client::protocol::wl_seat::WlSeat;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle, Dispatch};
@@ -23,7 +23,8 @@ use sctk::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use sctk::compositor::SurfaceData;
 use sctk::globals::GlobalData;
 use sctk::seat::pointer::{
-    PointerData, PointerDataExt, PointerEvent, PointerEventKind, PointerHandler,
+    AxisScroll, PointerData, PointerDataExt, PointerEvent, PointerEventKind, PointerHandler,
+    ThemedPointer,
 };
 use sctk::seat::SeatState;
 
@@ -34,6 +35,9 @@ use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::{self, DeviceId, WindowId};
 
 pub mod relative_pointer;
+
+const DEVICE_ID: crate::event::DeviceId =
+    crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
 
 impl PointerHandler for WinitState {
     fn pointer_frame(
@@ -52,7 +56,7 @@ impl PointerHandler for WinitState {
             },
         };
 
-        let themed_pointer = match seat_state.pointer.as_ref() {
+        let themed_pointer = match seat_state.pointer.clone() {
             Some(pointer) => pointer,
             None => {
                 warn!("Received pointer event without pointer");
@@ -60,9 +64,20 @@ impl PointerHandler for WinitState {
             },
         };
 
-        let device_id = crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
+        if themed_pointer.pointer() != pointer {
+            return;
+        }
 
-        for event in events {
+        let device_id = DEVICE_ID;
+        let mut next_axis = 0;
+        for (index, event) in events.iter().enumerate() {
+            match event.kind {
+                PointerEventKind::Enter { .. } => {
+                    self.pointer_left(&themed_pointer);
+                },
+                PointerEventKind::Leave { .. } if self.pointer_left(&themed_pointer) => continue,
+                _ => (),
+            }
             let surface = &event.surface;
 
             // The parent surface.
@@ -128,7 +143,7 @@ impl PointerHandler for WinitState {
                     self.events_sink
                         .push_window_event(WindowEvent::CursorEntered { device_id }, window_id);
 
-                    window.pointer_entered(Arc::downgrade(themed_pointer));
+                    window.pointer_entered(Arc::downgrade(&themed_pointer));
 
                     // Set the currently focused surface.
                     pointer.winit_data().inner.lock().unwrap().surface = Some(window_id);
@@ -138,15 +153,7 @@ impl PointerHandler for WinitState {
                         window_id,
                     );
                 },
-                PointerEventKind::Leave { .. } => {
-                    window.pointer_left(Arc::downgrade(themed_pointer));
-
-                    // Remove the active surface.
-                    pointer.winit_data().inner.lock().unwrap().surface = None;
-
-                    self.events_sink
-                        .push_window_event(WindowEvent::CursorLeft { device_id }, window_id);
-                },
+                PointerEventKind::Leave { .. } => (),
                 PointerEventKind::Motion { .. } => {
                     self.events_sink.push_window_event(
                         WindowEvent::CursorMoved { device_id, position },
@@ -169,53 +176,44 @@ impl PointerHandler for WinitState {
                         window_id,
                     );
                 },
-                PointerEventKind::Axis { horizontal, vertical, .. } => {
-                    // Get the current phase.
+                PointerEventKind::Axis { .. } if index < next_axis => (),
+                PointerEventKind::Axis { .. } => {
+                    // SCTK only merges adjacent axis entries within the Wayland frame.
+                    let (frame, last_axis) = ScrollFrame::collect(
+                        events[index..]
+                            .iter()
+                            .take_while(|event| &event.surface == surface)
+                            .map(|event| &event.kind),
+                    );
+                    next_axis = index + last_axis + 1;
                     let mut pointer_data = pointer.winit_data().inner.lock().unwrap();
-
-                    let has_discrete_scroll = horizontal.discrete != 0 || vertical.discrete != 0;
-
-                    // Figure out what to do about start/ended phases here.
-                    //
-                    // Figure out how to deal with `Started`. Also the `Ended` is not guaranteed
-                    // to be sent for mouse wheels.
-                    let phase = if horizontal.stop || vertical.stop {
-                        TouchPhase::Ended
-                    } else {
-                        match pointer_data.phase {
-                            // Discrete scroll only results in moved events.
-                            _ if has_discrete_scroll => TouchPhase::Moved,
-                            TouchPhase::Started | TouchPhase::Moved => TouchPhase::Moved,
-                            _ => TouchPhase::Started,
-                        }
-                    };
-
-                    // Update the phase.
-                    pointer_data.phase = phase;
-
-                    // Mice events have both pixel and discrete delta's at the same time. So prefer
-                    // the discrete values if they are present.
-                    let delta = if has_discrete_scroll {
-                        // NOTE: Wayland sign convention is the inverse of winit.
-                        MouseScrollDelta::LineDelta(
-                            (-horizontal.discrete) as f32,
-                            (-vertical.discrete) as f32,
-                        )
-                    } else {
-                        // NOTE: Wayland sign convention is the inverse of winit.
-                        MouseScrollDelta::PixelDelta(
-                            LogicalPosition::new(-horizontal.absolute, -vertical.absolute)
-                                .to_physical(scale_factor),
-                        )
-                    };
-
-                    self.events_sink.push_window_event(
-                        WindowEvent::MouseWheel { device_id, delta, phase },
-                        window_id,
-                    )
+                    pointer_data.scroll(frame, scale_factor, |delta, phase| {
+                        self.events_sink.push_window_event(
+                            WindowEvent::MouseWheel { device_id, delta, phase },
+                            window_id,
+                        );
+                    });
                 },
             }
         }
+    }
+}
+
+impl WinitState {
+    pub(super) fn pointer_left(&mut self, pointer: &Arc<ThemedPointer<WinitPointerData>>) -> bool {
+        let departure = pointer.pointer().winit_data().inner.lock().unwrap().leave();
+        let Some((window_id, event)) = departure else { return false };
+
+        // A destroyed surface's address may have been reused by another window.
+        if self
+            .windows
+            .get_mut()
+            .get(&window_id)
+            .is_some_and(|window| window.lock().unwrap().pointer_left(Arc::downgrade(pointer)))
+        {
+            self.events_sink.push_window_event(event, window_id);
+        }
+        true
     }
 }
 
@@ -337,7 +335,7 @@ impl PointerDataExt for WinitPointerData {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct WinitPointerDataInner {
     /// The associated locked pointer.
     locked_pointer: Option<ZwpLockedPointerV1>,
@@ -351,8 +349,8 @@ pub struct WinitPointerDataInner {
     /// Currently focused window.
     surface: Option<WindowId>,
 
-    /// Current axis phase.
-    phase: TouchPhase,
+    /// Active precision axes for this pointer's focused surface.
+    scroll: PrecisionScroll,
 }
 
 impl Drop for WinitPointerDataInner {
@@ -367,15 +365,116 @@ impl Drop for WinitPointerDataInner {
     }
 }
 
-impl Default for WinitPointerDataInner {
-    fn default() -> Self {
-        Self {
-            surface: None,
-            locked_pointer: None,
-            confined_pointer: None,
-            latest_button_serial: 0,
-            phase: TouchPhase::Ended,
+impl WinitPointerDataInner {
+    fn leave(&mut self) -> Option<(WindowId, WindowEvent)> {
+        self.scroll = PrecisionScroll::default();
+        self.surface
+            .take()
+            .map(|window_id| (window_id, WindowEvent::CursorLeft { device_id: DEVICE_ID }))
+    }
+
+    fn scroll(
+        &mut self,
+        frame: ScrollFrame,
+        scale_factor: f64,
+        mut emit: impl FnMut(MouseScrollDelta, TouchPhase),
+    ) {
+        let ScrollFrame { horizontal, vertical, source } = frame;
+        // Wayland's sign convention is the inverse of winit's.
+        if horizontal.discrete != 0 || vertical.discrete != 0 {
+            emit(
+                MouseScrollDelta::LineDelta(
+                    -(horizontal.discrete as f32),
+                    -(vertical.discrete as f32),
+                ),
+                TouchPhase::Moved,
+            );
+            return;
         }
+
+        let delta = MouseScrollDelta::PixelDelta(
+            LogicalPosition::new(-horizontal.absolute, -vertical.absolute)
+                .to_physical(scale_factor),
+        );
+        let moving = horizontal.absolute != 0.0 || vertical.absolute != 0.0;
+        if matches!(source, Some(AxisSource::Wheel | AxisSource::WheelTilt)) {
+            if moving {
+                emit(delta, TouchPhase::Moved);
+            }
+            return;
+        }
+
+        // A previous source may never send its stop, especially for continuous scroll.
+        if self.scroll.source.zip(source).is_some_and(|(previous, source)| previous != source) {
+            if !moving {
+                return;
+            }
+            self.scroll = PrecisionScroll::default();
+        }
+
+        let was_active = self.scroll.horizontal || self.scroll.vertical;
+        if moving {
+            self.scroll.source = source.or(self.scroll.source);
+        }
+        self.scroll.horizontal =
+            (self.scroll.horizontal || horizontal.absolute != 0.0) && !horizontal.stop;
+        self.scroll.vertical = (self.scroll.vertical || vertical.absolute != 0.0) && !vertical.stop;
+        let active = self.scroll.horizontal || self.scroll.vertical;
+
+        if was_active && !active {
+            emit(delta, TouchPhase::Ended);
+        } else if moving {
+            emit(delta, if was_active { TouchPhase::Moved } else { TouchPhase::Started });
+            if !active {
+                emit(
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+                    TouchPhase::Ended,
+                );
+            }
+        }
+
+        if !active {
+            self.scroll = PrecisionScroll::default();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PrecisionScroll {
+    horizontal: bool,
+    vertical: bool,
+    source: Option<AxisSource>,
+}
+
+#[derive(Default)]
+struct ScrollFrame {
+    horizontal: AxisScroll,
+    vertical: AxisScroll,
+    source: Option<AxisSource>,
+}
+
+impl ScrollFrame {
+    fn collect<'a>(events: impl Iterator<Item = &'a PointerEventKind>) -> (Self, usize) {
+        let mut frame = Self::default();
+        let mut last_axis = 0;
+        for (index, event) in events.enumerate() {
+            match *event {
+                PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. } => break,
+                PointerEventKind::Axis { horizontal, vertical, source, .. } => {
+                    for (axis, other) in
+                        [(&mut frame.horizontal, horizontal), (&mut frame.vertical, vertical)]
+                    {
+                        axis.absolute += other.absolute;
+                        axis.discrete = axis.discrete.saturating_add(other.discrete);
+                        axis.stop |= other.stop;
+                    }
+                    frame.source = frame.source.or(source);
+                    last_axis = index;
+                },
+                _ => (),
+            }
+        }
+        (frame, last_axis)
     }
 }
 
@@ -500,3 +599,218 @@ delegate_dispatch!(WinitState: [ WpCursorShapeDeviceV1: GlobalData] => SeatState
 delegate_dispatch!(WinitState: [ZwpPointerConstraintsV1: GlobalData] => PointerConstraintsState);
 delegate_dispatch!(WinitState: [ZwpLockedPointerV1: GlobalData] => PointerConstraintsState);
 delegate_dispatch!(WinitState: [ZwpConfinedPointerV1: GlobalData] => PointerConstraintsState);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn motion(absolute: f64) -> AxisScroll {
+        AxisScroll { absolute, ..AxisScroll::default() }
+    }
+
+    fn stop() -> AxisScroll {
+        AxisScroll { stop: true, ..AxisScroll::default() }
+    }
+
+    fn pixel(x: f64, y: f64, phase: TouchPhase) -> (MouseScrollDelta, TouchPhase) {
+        (MouseScrollDelta::PixelDelta(PhysicalPosition::new(x, y)), phase)
+    }
+
+    fn scroll(
+        pointer: &mut WinitPointerDataInner,
+        horizontal: AxisScroll,
+        vertical: AxisScroll,
+    ) -> Vec<(MouseScrollDelta, TouchPhase)> {
+        scroll_frame(pointer, ScrollFrame { horizontal, vertical, source: None })
+    }
+
+    fn scroll_frame(
+        pointer: &mut WinitPointerDataInner,
+        frame: ScrollFrame,
+    ) -> Vec<(MouseScrollDelta, TouchPhase)> {
+        let mut events = Vec::new();
+        pointer.scroll(frame, 2.0, |delta, phase| events.push((delta, phase)));
+        events
+    }
+
+    #[test]
+    fn horizontal_stop_keeps_vertical_motion_until_its_own_stop() {
+        for horizontal in [0.0, 1.5] {
+            let mut pointer = WinitPointerDataInner::default();
+            assert_eq!(scroll(&mut pointer, motion(horizontal), motion(-2.0)), [pixel(
+                -2.0 * horizontal,
+                4.0,
+                TouchPhase::Started
+            )],);
+            assert_eq!(scroll(&mut pointer, stop(), motion(-3.0)), [pixel(
+                0.0,
+                6.0,
+                TouchPhase::Moved
+            )],);
+            assert_eq!(scroll(&mut pointer, AxisScroll::default(), stop()), [pixel(
+                0.0,
+                0.0,
+                TouchPhase::Ended
+            )],);
+            assert!(scroll(&mut pointer, stop(), stop()).is_empty());
+        }
+    }
+
+    #[test]
+    fn partial_stop_is_silent_and_the_axis_can_restart() {
+        let mut pointer = WinitPointerDataInner::default();
+        let idle = AxisScroll::default();
+        assert_eq!(scroll(&mut pointer, motion(1.0), motion(2.0)), [pixel(
+            -2.0,
+            -4.0,
+            TouchPhase::Started
+        )],);
+        assert!(scroll(&mut pointer, stop(), idle).is_empty());
+        assert_eq!(scroll(&mut pointer, motion(3.0), idle), [pixel(-6.0, 0.0, TouchPhase::Moved)],);
+        assert!(scroll(&mut pointer, idle, stop()).is_empty());
+        assert_eq!(scroll(&mut pointer, stop(), idle), [pixel(0.0, 0.0, TouchPhase::Ended)]);
+        assert_eq!(scroll(&mut pointer, motion(3.0), idle), [pixel(
+            -6.0,
+            0.0,
+            TouchPhase::Started
+        )],);
+    }
+
+    #[test]
+    fn split_frame_merges_both_stops_and_source_up_to_focus_boundary() {
+        let idle = AxisScroll::default();
+        let axis = |horizontal, vertical, source| PointerEventKind::Axis {
+            time: 0,
+            horizontal,
+            vertical,
+            source,
+        };
+        let events = [
+            axis(stop(), idle, None),
+            PointerEventKind::Motion { time: 0 },
+            axis(idle, stop(), Some(AxisSource::Finger)),
+            PointerEventKind::Press { time: 0, button: 0, serial: 0 },
+            PointerEventKind::Leave { serial: 0 },
+            PointerEventKind::Enter { serial: 0 },
+            axis(motion(7.0), idle, None),
+        ];
+        let (frame, last_axis) = ScrollFrame::collect(events.iter());
+        assert_eq!(last_axis, 2);
+        assert_eq!(
+            (frame.horizontal, frame.vertical, frame.source),
+            (stop(), stop(), Some(AxisSource::Finger))
+        );
+
+        let mut pointer = WinitPointerDataInner::default();
+        scroll(&mut pointer, motion(1.0), motion(2.0));
+        assert_eq!(scroll_frame(&mut pointer, frame), [pixel(0.0, 0.0, TouchPhase::Ended)]);
+        assert!(scroll(&mut pointer, stop(), stop()).is_empty());
+    }
+
+    #[test]
+    fn same_axis_motion_and_stop_finishes_without_losing_motion() {
+        let idle = AxisScroll::default();
+        let mut pointer = WinitPointerDataInner::default();
+        let flick = AxisScroll { absolute: -3.0, ..stop() };
+        assert_eq!(scroll(&mut pointer, idle, flick), [
+            pixel(0.0, 6.0, TouchPhase::Started),
+            pixel(0.0, 0.0, TouchPhase::Ended)
+        ],);
+        assert_eq!(scroll(&mut pointer, idle, motion(-1.0)), [pixel(
+            0.0,
+            2.0,
+            TouchPhase::Started
+        )],);
+        assert_eq!(scroll(&mut pointer, idle, flick), [pixel(0.0, 6.0, TouchPhase::Ended)]);
+        assert!(scroll(&mut pointer, idle, stop()).is_empty());
+    }
+
+    #[test]
+    fn wheel_frames_do_not_change_precision_axes() {
+        let mut pointer = WinitPointerDataInner::default();
+        let wheel = || ScrollFrame {
+            horizontal: AxisScroll { absolute: 4.0, discrete: 2, stop: false },
+            vertical: AxisScroll { absolute: -8.0, discrete: -1, stop: true },
+            source: Some(AxisSource::Wheel),
+        };
+        let line_event = (MouseScrollDelta::LineDelta(-2.0, 1.0), TouchPhase::Moved);
+        let idle = AxisScroll::default();
+        assert_eq!(scroll_frame(&mut pointer, wheel()), [line_event]);
+        assert_eq!(scroll(&mut pointer, idle, motion(-1.0)), [pixel(
+            0.0,
+            2.0,
+            TouchPhase::Started
+        )],);
+        assert_eq!(scroll_frame(&mut pointer, wheel()), [line_event]);
+        let tilt = |horizontal| ScrollFrame {
+            horizontal,
+            source: Some(AxisSource::WheelTilt),
+            ..ScrollFrame::default()
+        };
+        assert_eq!(scroll_frame(&mut pointer, tilt(motion(1.0))), [pixel(
+            -2.0,
+            0.0,
+            TouchPhase::Moved
+        )]);
+        assert!(scroll_frame(&mut pointer, tilt(stop())).is_empty());
+        assert_eq!(scroll(&mut pointer, idle, stop()), [pixel(0.0, 0.0, TouchPhase::Ended)]);
+    }
+
+    #[test]
+    fn source_switch_does_not_carry_unterminated_axes_forward() {
+        let mut pointer = WinitPointerDataInner::default();
+        let idle = AxisScroll::default();
+        let continuous = |horizontal, vertical| ScrollFrame {
+            horizontal,
+            vertical,
+            source: Some(AxisSource::Continuous),
+        };
+        assert_eq!(scroll_frame(&mut pointer, continuous(motion(1.0), idle)), [pixel(
+            -2.0,
+            0.0,
+            TouchPhase::Started
+        )],);
+        assert_eq!(
+            scroll_frame(&mut pointer, ScrollFrame {
+                vertical: motion(-2.0),
+                source: Some(AxisSource::Finger),
+                ..ScrollFrame::default()
+            }),
+            [pixel(0.0, 4.0, TouchPhase::Started)],
+        );
+        assert!(scroll_frame(&mut pointer, continuous(stop(), stop())).is_empty());
+        assert!(scroll_frame(&mut pointer, continuous(idle, idle)).is_empty());
+        assert_eq!(scroll(&mut pointer, idle, stop()), [pixel(0.0, 0.0, TouchPhase::Ended)]);
+    }
+
+    #[test]
+    fn focus_departure_resets_scroll_even_without_a_window_to_notify() {
+        let mut pointer = WinitPointerDataInner::default();
+        let first_window = WindowId::from(1);
+        let second_window = WindowId::from(2);
+        let idle = AxisScroll::default();
+        pointer.surface = Some(first_window);
+        scroll(&mut pointer, motion(1.0), idle);
+        let left = WindowEvent::CursorLeft { device_id: DEVICE_ID };
+        assert_eq!(pointer.leave(), Some((first_window, left.clone())));
+        assert_eq!(pointer.leave(), None);
+
+        pointer.surface = Some(second_window);
+        assert_eq!(scroll(&mut pointer, idle, motion(-2.0)), [pixel(
+            0.0,
+            4.0,
+            TouchPhase::Started
+        )],);
+        assert_eq!(pointer.leave(), Some((second_window, left)));
+        assert!(scroll(&mut pointer, idle, stop()).is_empty());
+
+        // Decorations can receive axis events without a tracked content focus.
+        scroll(&mut pointer, motion(1.0), idle);
+        assert_eq!(pointer.leave(), None);
+        assert_eq!(scroll(&mut pointer, idle, motion(-2.0)), [pixel(
+            0.0,
+            4.0,
+            TouchPhase::Started
+        )],);
+    }
+}

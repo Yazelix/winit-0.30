@@ -63,6 +63,13 @@ impl WinitSeatState {
     pub fn new() -> Self {
         Default::default()
     }
+
+    fn take_pointer(&mut self) -> Option<Arc<ThemedPointer<WinitPointerData>>> {
+        if let Some(relative_pointer) = self.relative_pointer.take() {
+            relative_pointer.destroy();
+        }
+        self.pointer.take()
+    }
 }
 
 impl SeatHandler for WinitState {
@@ -171,24 +178,8 @@ impl SeatHandler for WinitState {
                 }
             },
             SeatCapability::Pointer => {
-                if let Some(relative_pointer) = seat_state.relative_pointer.take() {
-                    relative_pointer.destroy();
-                }
-
-                if let Some(pointer) = seat_state.pointer.take() {
-                    let pointer_data = pointer.pointer().winit_data();
-
-                    // Remove the cursor from the mapping.
-                    let surface_id = pointer.surface().id();
-                    let _ = self.pointer_surfaces.remove(&surface_id);
-
-                    // Remove the inner locks/confines before dropping the pointer.
-                    pointer_data.unlock_pointer();
-                    pointer_data.unconfine_pointer();
-
-                    if pointer.pointer().version() >= 3 {
-                        pointer.pointer().release();
-                    }
+                if let Some(pointer) = seat_state.take_pointer() {
+                    self.remove_pointer(pointer);
                 }
             },
             SeatCapability::Keyboard => {
@@ -214,12 +205,31 @@ impl SeatHandler for WinitState {
         _queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
-        let _ = self.seats.remove(&seat.id());
+        if let Some(mut seat_state) = self.seats.remove(&seat.id()) {
+            if let Some(pointer) = seat_state.take_pointer() {
+                self.remove_pointer(pointer);
+            }
+        }
         self.on_keyboard_destroy(&seat.id());
     }
 }
 
 impl WinitState {
+    fn remove_pointer(&mut self, pointer: Arc<ThemedPointer<WinitPointerData>>) {
+        self.pointer_left(&pointer);
+        self.pointer_surfaces.remove(&pointer.surface().id());
+
+        // Remove constraints before releasing the pointer.
+        let pointer = pointer.pointer();
+        let pointer_data = pointer.winit_data();
+        pointer_data.unlock_pointer();
+        pointer_data.unconfine_pointer();
+
+        if pointer.version() >= 3 {
+            pointer.release();
+        }
+    }
+
     fn on_keyboard_destroy(&mut self, seat: &ObjectId) {
         for (window_id, window) in self.windows.get_mut() {
             let mut window = window.lock().unwrap();

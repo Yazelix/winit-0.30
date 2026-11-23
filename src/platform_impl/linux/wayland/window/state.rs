@@ -617,17 +617,16 @@ impl WindowState {
     }
 
     /// Pointer has left the top-level.
-    pub fn pointer_left(&mut self, removed: Weak<ThemedPointer<WinitPointerData>>) {
-        let mut new_pointers = Vec::new();
-        for pointer in self.pointers.drain(..) {
-            if let Some(pointer) = pointer.upgrade() {
-                if pointer.pointer() != removed.upgrade().unwrap().pointer() {
-                    new_pointers.push(Arc::downgrade(&pointer));
-                }
+    pub fn pointer_left(&mut self, removed: Weak<ThemedPointer<WinitPointerData>>) -> bool {
+        let mut had_pointer = false;
+        self.pointers.retain(|pointer| {
+            if pointer.ptr_eq(&removed) {
+                had_pointer = true;
+                return false;
             }
-        }
-
-        self.pointers = new_pointers;
+            pointer.strong_count() != 0
+        });
+        had_pointer
     }
 
     /// Refresh the decorations frame if it's present returning whether the client should redraw.
