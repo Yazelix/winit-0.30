@@ -46,3 +46,4 @@ changelog entry.
 - On macOS, add `set_ime_text`, `take_ime_clauses`, and `take_ime_replacement` for IME clauses and reconversion.
 - On Wayland, add `ActiveEventLoopExtWayland::set_wake_on_wayland_read` to wake `ControlFlow::Wait` on any display read.
 - On Wayland, add `WindowExtWayland::has_client_side_frame` and `WindowExtWayland::content_corner_radius` (always zero with this fork's frames).
+- On macOS, add `EventLoopBuilderExtMacOS::with_init_before_finish_launching` and `install_default_menu`.
