@@ -598,6 +598,19 @@ impl WindowState {
         }
     }
 
+    /// Rune: whether a client-side frame draws the window's decorations, whatever state it is in:
+    /// a maximized, tiled or fullscreen window keeps its frame, which only hides parts of itself.
+    /// False when the compositor draws the decorations, when decorations are off, and when the
+    /// frame could not be made (no subcompositor, or a frame that failed to build).
+    #[inline]
+    pub fn has_client_side_frame(&self) -> bool {
+        client_side_frame(
+            self.decorate,
+            self.last_configure.as_ref().map(|configure| configure.decoration_mode),
+            self.frame.is_some(),
+        )
+    }
+
     /// Get the outer size of the window.
     #[inline]
     pub fn outer_size(&self) -> LogicalSize<u32> {
@@ -1234,5 +1247,28 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
         Some(Theme::Light) => sctk_adwaita::FrameConfig::light(),
         Some(Theme::Dark) => sctk_adwaita::FrameConfig::dark(),
         None => sctk_adwaita::FrameConfig::auto(),
+    }
+}
+
+/// Rune: whether a client-side frame draws a window: decorations are on, the last configure
+/// chose client-side decorations, and the frame was made.
+fn client_side_frame(decorate: bool, mode: Option<DecorationMode>, has_frame: bool) -> bool {
+    decorate && mode == Some(DecorationMode::Client) && has_frame
+}
+
+#[cfg(test)]
+mod client_side_frame_tests {
+    use super::{client_side_frame, DecorationMode};
+
+    #[test]
+    fn needs_decorations_a_client_side_configure_and_a_frame() {
+        assert!(client_side_frame(true, Some(DecorationMode::Client), true));
+        // Decorations off: the frame is kept hidden, not drawn.
+        assert!(!client_side_frame(false, Some(DecorationMode::Client), true));
+        // The compositor draws them, or nothing was configured yet.
+        assert!(!client_side_frame(true, Some(DecorationMode::Server), true));
+        assert!(!client_side_frame(true, None, true));
+        // No subcompositor, or the frame failed to build.
+        assert!(!client_side_frame(true, Some(DecorationMode::Client), false));
     }
 }

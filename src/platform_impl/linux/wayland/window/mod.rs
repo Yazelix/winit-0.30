@@ -429,6 +429,12 @@ impl Window {
         self.window_state.lock().unwrap().is_decorated()
     }
 
+    /// Rune: see `WindowExtWayland::has_client_side_frame`.
+    #[inline]
+    pub fn has_client_side_frame(&self) -> bool {
+        self.window_state.lock().unwrap().has_client_side_frame()
+    }
+
     #[inline]
     pub fn set_window_level(&self, _level: WindowLevel) {}
 
