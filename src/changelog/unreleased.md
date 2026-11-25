@@ -44,3 +44,4 @@ changelog entry.
 ### Added
 
 - On macOS, add `set_ime_text`, `take_ime_clauses`, and `take_ime_replacement` for IME clauses and reconversion.
+- On Wayland, add `ActiveEventLoopExtWayland::set_wake_on_wayland_read` to wake `ControlFlow::Wait` on any display read.
